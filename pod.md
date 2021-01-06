@@ -128,4 +128,19 @@ Commercial support is available at
 </body>
 </html>
 
+7、删除pod
+
+[root@fintest yaml]# kubectl delete -f nginx-pod.yaml 
+pod "nginx-pod" deleted
+[root@fintest yaml]# 
+
+[root@fintest ~]# kubectl get pods
+NAME                               READY   STATUS    RESTARTS   AGE
+my-nginx-c7dd45d78-ftwnp           1/1     Running   0          3h46m
+my-nginx-c7dd45d78-zz65h           1/1     Running   0          22h
+nginx-deployment-fc6884c76-gx9ck   1/1     Running   0          7m39s
+nginx-deployment-fc6884c76-qxh57   1/1     Running   0          7m39s
+[root@fintest ~]# 
+
+
 
