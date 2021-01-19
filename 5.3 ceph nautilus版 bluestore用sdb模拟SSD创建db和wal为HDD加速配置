@@ -1,0 +1,143 @@
+ceph nautilus版 bluestore用sdb模拟SSD创建db和wal为HDD加速配置
+硬件环境：虚拟机，4core+4G+100G系统盘+50G数据盘X2+50G模拟SSD
+操作系统：CentOS Linux release 7.8.2003 (Core)
+软件版本：nautilus 14.2.8
+部署版本：ceph-deploy 2.0.1
+Ceph网络：Ceph Cluster网络均采用192.168.248.0/24，Ceph Public网络采用172.16.248.0/24
+注：原文这里复用了Public网络和Cluster网络、这里我们采用两个网络进行互通。
+ 
+集群规划：
+ceph1：192.168.248.161/172.16.248.161
+ceph2：192.168.248.162/172.16.248.162
+ceph3：192.168.248.163/172.16.248.163
+系统初始化
+注：如果没有特殊说明，本小节所有操作需要在所有节点上执行本文档的初始化操作。
+配置主机名
+# 可以将下面的节点名称替换为自己的主机名称 hostnamectl set-hostname ceph1 hostnamectl set-hostname ceph2 hostnamectl set-hostname ceph3
+如果 DNS 不支持主机名称解析，还需要在每台机器的 /etc/hosts 文件中添加主机名和 IP 的对应关系：
+cat >> /etc/hosts <<EOF
+# Ceph Cluster Network
+192.168.248.161 ceph1
+192.168.248.162 ceph2
+192.168.248.163 ceph3
+192.168.248.164 ceph_client
+# Ceph Public Network
+172.16.248.161 ceph1
+172.16.248.162 ceph2
+172.16.248.163 ceph3
+EOF
+
+添加节点SSH互信
+ssh-keygen -t rsa -P ""
+ssh-copy-id ceph1
+ssh-copy-id ceph2
+ssh-copy-id ceph3
+ssh-copy-id ceph_client
+
+关闭防火墙
+systemctl stop firewalld systemctl disable firewalld iptables -F && iptables -X && iptables -F -t nat && iptables -X -t nat iptables -P FORWARD ACCEPT
+
+关闭SELinux
+setenforce 0 sed -i 's/^SELINUX=.*/SELINUX=disabled/' /etc/selinux/config
+
+配置EPEL源
+配置yum源，由于网络环境因素，因此将yum源统一配置到国内阿里云，加快rpm的安装配置，需要配置CentOS的基础源、EPEL源和Ceph源：
+# 删除默认yum源并配置阿里yum源 rm -f /etc/yum.repos.d/*.repo wget http://mirrors.aliyun.com/repo/Centos-7.repo -P /etc/yum.repos.d/ # 安装EPEL源 wget http://mirrors.aliyun.com/repo/epel-7.repo -P /etc/yum.repos.d/
+
+配置Ceph源
+cat > /etc/yum.repos.d/ceph.repo <<EOF
+[noarch] 
+name=Ceph noarch 
+baseurl=https://mirrors.aliyun.com/ceph/rpm-nautilus/el7/noarch/ 
+enabled=1 
+gpgcheck=0 
+
+[x86_64] 
+name=Ceph x86_64 
+baseurl=https://mirrors.aliyun.com/ceph/rpm-nautilus/el7/x86_64/ 
+enabled=1 
+gpgcheck=0
+EOF
+安装依赖包
+安装Ceph-deploy部署工具，默认EPEL源提供的ceph-deploy版本是1.5，务必确保安装版本为2.0.1或之上版本，否则安装过程中会有很多问题。
+# 更新yum源 yum update -y # 安装工具包、python-setuptools一定要安装、不然会报错的 yum install -y chrony conntrack ipset jq iptables curl sysstat libseccomp wget socat git python-setuptools bash-completion open-vm-tools vim htop nload lrzsz ntp ntpdate # 安装ceph-deploy部署工具 yum install ceph-deploy -y #校验版本 ceph-deploy --version
+
+配置时钟同步
+ntpdate 192.168.253.11
+
+
+创建PV
+pvcreate /dev/sdb
+创建VG
+vgcreate db_vg /dev/sdb
+创建LV
+lvcreate -n db_lv_sdc -L 5G db_vg
+lvcreate -n db_lv_sdd -L 5G db_vg
+lvcreate -n wal_lv_sdc -L 1G db_vg
+lvcreate -n wal_lv_sdd -L 1G db_vg
+
+有一些硬盘可能是以前Ceph集群里的数据盘或者曾经安装过操作系统，那么这些硬盘上很可能
+有未清理的分区，lsblk命令可以看到各个硬盘下是否有分区。假如/dev/sdc硬盘下发现有分区信
+息，可用如下命令清除：
+ceph-volume lvm zap /dev/sdc --destroy
+
+部署Ceph集群
+Ceph系统初始化完成以后、现在我们通过Ceph-deploy开始部署Ceph集群。Ceph-deploy部署过程中会生成一些集群初始化配置文件和key，后续扩容的时候也需要使用到，因此，建议在admin-node上创建一个单独的目录，后续操作都进入到该目录中进行操作，以创建的ceph-admin为例。这里我在/root/下面创建一个ceph-admin目录：
+mkdir -p /root/ceph-admin
+# 后续所有的操作均需要在ceph-admin目录下面完成
+cd /root/ceph-admin/
+现在我们开始安装Ceph所需的安装包，安装过程中可以使用ceph-deploy install提供的安装方式。这个命令会自动安装EPEL源，重新设定Ceph源；这里我们已经设置到国内源了，因此采用手动安装Ceph安装包方式，为了保障后续的安装，我们在三个节点上将Ceph的安装包都部署上，我们在三个节点上分别执行下面的命令即可：
+yum install ceph-mon ceph-radosgw ceph-mds ceph-mgr ceph-osd ceph-common -y
+
+现在我们执行下面的命令创建一个Ceph Cluster集群，这里我们需要制定cluster-network（集群内部通讯）和public-network（外部访问Ceph集群）：
+ceph-deploy new --cluster-network 192.168.248.0/24 --public-network 172.16.248.0/24 ceph1 ceph2 ceph3
+
+现在我们开始初始化monitor节点，我们直接执行下面的命令即可完成Ceph集群初始化，初始化完毕后会自动生成以下几个文件，这些文件用于后续和Ceph认证交互使用：
+ceph-deploy mon create-initial
+
+初始化完成之后我们将admin的认证密钥拷贝到其他节点上，便于ceph命令行可以通过keyring和ceph集群进行交互：
+ceph-deploy admin ceph1 ceph2 ceph3
+
+添加mgr，生产中一般部署3个或者5个节点的Monitor，确保集群高可用状态。
+ceph-deploy mgr create ceph1 ceph2 ceph3
+我们可以看到当前Ceph集群的mon节点数量为3、分别是 ceph1，ceph2和ceph3。我们还可以通过ceph mon dump查看集群中monitor的状态：
+
+
+创建osd
+# 不需要加--bluestore 参数，默认就是使用bluestore方式
+ceph-deploy osd create --bluestore ceph1 --data /dev/sdc --block-db db_vg/db_lv_sdc --block-wal db_vg/wal_lv_sdc
+ceph-deploy osd create --bluestore ceph1 --data /dev/sdd --block-db db_vg/db_lv_sdd --block-wal db_vg/wal_lv_sdd
+ceph-deploy osd create --bluestore ceph2 --data /dev/sdc --block-db db_vg/db_lv_sdc --block-wal db_vg/wal_lv_sdc
+ceph-deploy osd create --bluestore ceph2 --data /dev/sdd --block-db db_vg/db_lv_sdd --block-wal db_vg/wal_lv_sdd
+ceph-deploy osd create --bluestore ceph3 --data /dev/sdc --block-db db_vg/db_lv_sdc --block-wal db_vg/wal_lv_sdc
+ceph-deploy osd create --bluestore ceph3 --data /dev/sdd --block-db db_vg/db_lv_sdd --block-wal db_vg/wal_lv_sdd
+
+查看集群健康状况 ceph -s
+
+
+查看osd状态
+
+创建资源池mypool
+[root@ceph1 ceph-admin]# ceph osd pool create mypool 128 128
+
+
+pool已创建成功，可以通过ceph osd lspools查看当前集群的pool情况
+
+默认创建的资源池为3副本，可以通过ceph osd pool get mypool size
+
+查看pgs和pgp数量情况
+ceph osd pool get mypool pg_num
+
+ceph osd pool get mypool pgp_num
+
+如果有需要，可以调整pool的参数，例如调整为2个副本
+ceph osd pool set mypool size 2
+
+ceph osd pool get mypool size
+
+可以看到，当前已经调整pool副本的数量至2副本，也可以调整其他参数，如pg_num,pgp_num,如pg_num和pgp_num的数量为256
+
+ceph osd pool set mypool pg_num 256
+ceph osd pool set mypool pgp_num 256
+
+
