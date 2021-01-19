@@ -1,0 +1,410 @@
+k8s存储(Ceph-CSI)
+
+
+
+1.使用Ceph-CSI为默认storageClass
+
+1.1 cephCSI存储配置
+
+ceph存储由外部提供,以下步骤在ceph上操作,目的是为kubenetes访问ceph使用
+
+1.ceph新建ceph pool
+
+
+
+Bash
+ceph osd pool create k8s
+
+
+
+pool ' k8s' created
+
+2.新建ceph用户
+
+
+
+Bash
+ ceph auth get-or-create client.k8s mon 'profile rbd' osd 'profile rbd pool=k8s' mgr 'profile rbd pool=k8s'
+
+[client.k8s]
+
+        key: AQCVBgVgJs+uBBAfasfadGDDggdEapHd2uICOdlCeiA==
+
+2.查看ceph 信息
+
+a.记录fsid的信息(集群ID)
+
+b.mon_host 信息(Ceph监视器),暂时只支持V1, 参考文档
+
+
+
+Bash
+[root@uic_sh_gw ceph]# cat ceph.conf
+
+[global]
+
+fsid = 6553e7de-1b81-454c-a381-40fdsaFfas9 # 重点
+
+mon_initial_members = uic_sh_gw, uic_sh_stack03, uic_sh_stack04, uic_sh_stack05, uic_sh_stack06
+
+mon_host = 10.10.160.2,10.10.160.3,10.10.160.4,10.10.160.5,10.10.160.6  #重点
+
+auth_cluster_required = cephx
+
+auth_service_required = cephx
+
+auth_client_required = cephx
+
+
+
+rbd 就是由 Ceph 集群提供出来的块设备。
+
+
+
+1.2  kubenetes 环境配置
+
+Kubenetes 系统环境
+
+
+
+Bash
+[root@k8smaster01 ~]# kubectl get node 
+
+NAME          STATUS   ROLES    AGE   VERSION
+
+k8smaster01   Ready    <none>   47d   v1.19.4
+
+k8smaster02   Ready    <none>   47d   v1.19.4
+
+k8smaster03   Ready    <none>   48d   v1.19.4
+
+node01        Ready    <none>   48d   v1.19.4
+
+node02        Ready    <none>   48d   v1.19.4
+
+1.  部署Ceph-CSI
+
+1.ceph-csi下载
+
+
+
+Bash
+git clone --depth 1 --branch v3.1.0 https://gitclone.com/github.com/ceph/ceph-csi
+
+2.修改ConfigMap信息
+
+修改访问Ceph集群配置,进入目录(/root/ceph-csi/deploy/rbd/kubernetes)
+
+
+
+Bash
+[root@k8smaster01 kubernetes]# pwd
+
+/root/ceph-csi/deploy/rbd/kubernetes
+
+[root@k8smaster01 kubernetes]# ll
+
+total 44
+
+-rw-r--r-- 1 root root  317 Jan 18 12:43 csi-config-map.yaml
+
+-rw-r--r-- 1 root root 1689 Jan 18 12:53 csi-nodeplugin-psp.yaml
+
+-rw-r--r-- 1 root root  881 Jan 18 12:53 csi-nodeplugin-rbac.yaml
+
+-rw-r--r-- 1 root root 1315 Jan 18 12:53 csi-provisioner-psp.yaml
+
+-rw-r--r-- 1 root root 3131 Jan 18 12:53 csi-provisioner-rbac.yaml
+
+-rw-r--r-- 1 root root 5502 Jan 18 13:08 csi-rbdplugin-provisioner.yaml
+
+-rw-r--r-- 1 root root 5857 Jan 18 18:21 csi-rbdplugin.yaml
+
+-rw-r--r-- 1 root root  161 Jan 18 17:19 csi-rbd-secret.yaml #自己生成的secret
+
+-rw-r--r-- 1 root root  706 Jan 18 13:21 storageclass.yaml  #自己生成的动态存储
+
+修改ConfigMap的信息,vim csi-config-map.yaml
+
+ 使用configmap将服务的clusterID等信息录入到集群(namespace)中
+
+
+
+YAML
+---
+
+apiVersion: v1
+
+kind: ConfigMap
+
+data:
+
+  config.json: |-
+
+    [
+
+     {
+
+        "clusterID": "6552e7de-1b81-45ec-a081-40e5Gcf1d1e9",
+
+        "monitors": [
+
+          "10.10.160.2",
+
+          "10.10.160.4",
+
+          "10.10.160.5",
+
+          "10.10.160.6"
+
+        ]
+
+      }
+
+    ]
+
+metadata:
+
+  name: ceph-csi-config
+
+~                                                                                                                                                         
+
+
+
+3.创建ceph-CSI的namespace空间
+
+•ceph-CSI 单独使用的ns资源
+
+
+
+Bash
+kubectl create ns ceph-csi
+
+kubectl -n ceph-csi apply -f csi-config-map.yaml
+
+4.生成ceph用户(k8s)密钥
+
+新建secret文件:vim csi-rbd-secret.yaml
+
+将ceph创建的k8s的用户名和密码生成secret
+
+
+
+YAML
+apiVersion: v1
+
+kind: Secret
+
+metadata:
+
+  name: csi-rbd-secret
+
+  namespace: ceph-csi
+
+stringData:
+
+  userID: k8s
+
+  userKey: AQCVBgVgJFGsfff8oHCJnGGpHd2GHCOdlCeiA==
+
+
+
+生成secret:kubectl create -f csi-rbd-secret.yaml
+
+2. RBAC 权限配置
+
+1.更改默认配置的namespace
+
+将所有配置清单中的 namespace 改成 ceph-csi：
+
+
+
+YAML
+sed -i "s/namespace: default/namespace: ceph-csi/g" $(grep -rl "namespace: default" ./)
+
+sed -i -e "/^kind: ServiceAccount/{N;N;a\  namespace: ceph-csi  # 输入到这里的时候需要按一下回车键，在下一行继续输入
+
+  }" $(egrep -rl "^kind: ServiceAccount" ./)
+
+2.创建 ServiceAccount 和 RBAC ClusterRole/ClusterRoleBinding 资源对象：
+
+
+
+YAML
+kubectl create -f csi-provisioner-rbac.yaml
+
+kubectl create -f csi-nodeplugin-rbac.yaml
+
+
+
+3.创建 PodSecurityPolicy：
+
+
+
+YAML
+kubectl create -f csi-provisioner-psp.yaml
+
+kubectl create -f csi-nodeplugin-psp.yaml
+
+3.CSI sidecar 和 RBD CSI driver
+
+CSI sidecar : 用来简化开发和部署, 用来監控Kubernetes API、針對CSI容器觸發一些適當的操作,根据需求更新API,一般配合 CSi Drive去使用
+
+修改配置文件
+
+将 csi-rbdplugin-provisioner.yaml 和 csi-rbdplugin.yaml 中的 kms 部分配置注释掉：
+
+csi-rbdplugin-provisioner.yaml:
+
+ 
+
+ 
+
+
+
+csi-rbdplugin.yaml:
+
+ 
+
+ 
+
+部署 Sidecar 容器: 
+
+包括 external-provisioner、external-attacher、csi-resizer 和 csi-rbdplugin
+
+
+
+Bash
+ kubectl -n ceph-csi create -f csi-rbdplugin-provisioner.yaml
+
+部署 RBD CSI Driver容器:
+
+
+
+Bash
+kubectl -n ceph-csi create -f csi-rbdplugin.yaml
+
+查看部署信息:注意这里的状态
+
+kubectl get pod -n ceph-csi
+
+ 
+
+4.创建 Storageclass
+
+￮clusterID : 对应的fsid( ceph )
+
+￮imageFeatures: 这是磁盘映像文件的特征，需要 uname -r 查看集群系统内核所支持的特性，centos7可以用 layering 
+
+
+
+YAML
+cat <<EOF > storageclass.yaml
+
+---
+
+apiVersion: storage.k8s.io/v1
+
+kind: StorageClass
+
+metadata:
+
+   name: csi-rbd-sc
+
+provisioner: rbd.csi.ceph.com
+
+parameters:
+
+   clusterID: 6552e7de-1b81-45ec-a081-40e50cf1d1e9
+
+   pool: k8s
+
+   imageFeatures: layering
+
+   csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+
+   csi.storage.k8s.io/provisioner-secret-namespace: ceph-csi
+
+   csi.storage.k8s.io/controller-expand-secret-name: csi-rbd-secret
+
+   csi.storage.k8s.io/controller-expand-secret-namespace: ceph-csi
+
+   csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+
+   csi.storage.k8s.io/node-stage-secret-namespace: ceph-csi
+
+   csi.storage.k8s.io/fstype: ext4
+
+reclaimPolicy: Delete
+
+allowVolumeExpansion: true
+
+mountOptions:
+
+   - discard
+
+EOF
+
+5.创建storageClass
+
+a.查询
+
+
+
+Bash
+[root@k8smaster01 rbd]# kubectl get StorageClass
+
+NAME         PROVISIONER        RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+
+csi-rbd-sc   rbd.csi.ceph.com   Delete          Immediate           true                   41m
+
+设置成默认存储( 可选 )
+
+
+
+Bash
+kubectl patch storageclass csi-rbd-sc -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+[root@k8smaster01 rbd]# kubectl get StorageClass
+
+NAME                   PROVISIONER        RECLAIMPOLICY   VOLUMEBINDINGMODE   ALLOWVOLUMEEXPANSION   AGE
+
+csi-rbd-sc (default)   rbd.csi.ceph.com   Delete          Immediate           true                   25h
+
+5.验证: PVC
+
+使用官方PVCyaml,创建pvc资源()
+
+
+
+Bash
+cd /root/ceph-csi/examples/rbd
+
+kubectl apply -f pvc.yaml
+
+查看: STATUS 显示Bound表示成功
+
+
+
+Bash
+[root@k8smaster01 rbd]# kubectl get pvc
+
+NAME      STATUS   VOLUME                                     CAPACITY   ACCESS MODES   STORAGECLASS   AGE
+
+rbd-pvc   Bound    pvc-7f79cfc7-46ee-4dc9-9bc3-c3f1ab98002b   1Gi        RWO            csi-rbd-sc     21h
+
+也有一些其他测试,这里不做表述了,下面是参考的文章连接
+
+注意事项:comfigmap和secret 都是自己生成的,不要粘贴
+
+参考链接：
+
+http://docs.ceph.org.cn/rados/configuration/ceph-conf/
+
+http://www.kubeasy.com/
+
+https://fuckcloudnative.io/posts/kubernetes-storage-using-ceph-rbd/
+
+
+
+
