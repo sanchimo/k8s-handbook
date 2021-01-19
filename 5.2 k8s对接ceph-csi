@@ -1,0 +1,161 @@
+注：需要用到的镜像
+
+一、具体相关文档可以查看ceph官网：
+https://docs.ceph.com/docs/master/rbd/rbd-kubernetes/
+二、要将Ceph块设备与Kubernetes v1.13及更高版本一起使用，必须ceph-csi在Kubernetes环境中安装和配置
+该映像会动态配置RBD映像以支持Kubernetes 卷并将这些RBD映像映射为工作节点上的块设备（可选地安装映像中包含的文件系统）引用RBD支持的卷的运行 Pod
+三、首先我们需要一个部署一个ceph存储集群以及k8s集群，如果没有部署相关集群（可以参数之前文档部署ceph存储以及k8s集群）
+1、首先需要在我们ceph上面创建一个存储池：
+默认情况下，Ceph块设备使用该rbd池。为Kubernetes卷存储创建一个池。确保您的Ceph集群正在运行，然后创建池。
+# ceph osd pool create k8s
+# ceph osd pool application enable k8s rbd 
+查看ceph里面有哪些存储池：
+# ceph osd pool ls
+
+三、配置ceph-csi
+1、首先需要在k8s上面安装ceph客户端：
+yum -y install ceph # 注意需要配置ceph的相关yum源，可以从ceph集群那台主机上面将ceph的yum源拷贝到k8s集群的所有节点上面
+2、设置CEPH客户端身份验证:
+# cat /etc/ceph/ceph.client.admin.keyring 
+
+这里我们需要将/etc/ceph/ceph.client.admin.keyring 复制到k8s集群的所有节点上。
+在CEPH-CSI需要ConfigMap存储在Kubernetes以限定一个Ceph监视器地址为Ceph的群集对象。收集Ceph集群唯一的fsid和监视器地址：
+查看cephfsid和监视器地址:
+# ceph mon dump
+
+3、生成类似于以下示例的csi-config-map.yaml文件，将fsid替换为“ clusterID”，并将监视器地址替换为“ monitors”：
+注意 ceph-csi当前仅支持旧版V1协议。
+[root@master-1 csi]# cat <<EOF> csi-config-map.yaml
+apiVersion: v1
+kind: ConfigMap
+data:
+config.json: |-
+[
+{
+"clusterID": "399e3c25-8257-4414-adef-2e7f184b126e",
+"monitors": [
+"192.168.248.161:6789",
+"192.168.248.162:6789",
+"192.168.248.163:6789"
+]
+}
+]
+metadata:
+name: ceph-csi-config
+
+部署config-map:
+kubectl apply -f csi-config-map.yaml
+
+4、使用新创建的admin 用户ID和cephx密钥生成secret
+cat <<EOF > csi-rbd-secret.yaml
+apiVersion: v1
+kind: ConfigMap
+data:
+config.json: |-
+[
+{
+"clusterID": "399e3c25-8257-4414-adef-2e7f184b126e",
+"monitors": [
+"192.168.248.161:6789",
+"192.168.248.162:6789",
+"192.168.248.163:6789"
+]
+}
+]
+metadata:
+name: ceph-csi-config
+[root@master-1 csi]# cat csi-rbd-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+name: csi-rbd-secret
+namespace: default
+stringData:
+userID: admin
+userKey: AQDrvAdf6VbkOhAA8z5jsOxphpuIakHG9/amhQ==
+EOF
+
+部署secret kubectl apply -f csi-rbd-secret.yaml
+
+5、配置CEPH-CSI插件
+创建必需的ServiceAccount和RBAC ClusterRole / ClusterRoleBinding Kubernetes对象。这些对象不一定需要针对您的Kubernetes环境进行自定义，因此可以从 ceph -csi部署YAML中按原样使用
+kubernetes/csi-provisioner-rbac.yaml kubernetes/csi-nodeplugin-rbac.yaml
+文件已下载到本地目录 E:\k8s\ceph-csi-master\deploy\rbd\kubernetes
+kubectl apply -f csi-provisioner-rbac.yaml kubectl apply -f csi-nodeplugin-rbac.yaml
+
+6、最后，创建ceph-csi设置程序和节点插件
+kubectl apply -f kms-config.yaml
+kubectl apply -f csi-rbdplugin-provisioner.yaml
+kubectl apply -f csi-rbdplugin.yaml
+7、查看启动插件的pod：（如下图情况说明相关插件部署完成）
+
+8、用CEPH块设备：
+首先创建StorageClass
+Kubernetes StorageClass定义了一个存储类。 可以创建多个StorageClass对象以映射到不同的服务质量级别（即NVMe与基于HDD的池）和功能。
+[root@master-1 csi]# cat <<EOF > csi-rbd-sc.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+name: csi-rbd-sc
+provisioner: rbd.csi.ceph.com
+parameters:
+clusterID: 399e3c25-8257-4414-adef-2e7f184b126e 
+pool: k8s
+csi.storage.k8s.io/provisioner-secret-name: csi-rbd-secret
+csi.storage.k8s.io/provisioner-secret-namespace: default
+csi.storage.k8s.io/node-stage-secret-name: csi-rbd-secret
+csi.storage.k8s.io/node-stage-secret-namespace: default
+reclaimPolicy: Delete
+mountOptions:
+- discard
+EOF
+
+# kubectl apply -f csi-rbd-sc.yaml
+
+查看storageclass：
+
+使用以文件系统PersistentVolumeClaim绑定 到Pod资源作为已挂载的文件系统
+cat <<EOF > mypod.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+name: myapp
+spec:
+serviceName: myapp-sts-svc
+replicas: 1
+selector:
+matchLabels:
+app: myapp-pod
+template:
+metadata:
+labels:
+app: myapp-pod
+spec:
+containers:
+- name: myapp
+image: ikubernetes/myapp:v1
+ports:
+- containerPort: 80
+name: web
+volumeMounts:
+- name: myappdata
+mountPath: /usr/share/nginx/html
+volumeClaimTemplates:
+- metadata:
+name: myappdata
+spec:
+accessModes: 
+- ReadWriteOnce
+storageClassName: csi-rbd-sc
+resources:
+requests:
+storage: 5Gi
+EOF
+
+# kubectl apply -f mypod.yaml
+查看pod是否正常启动
+
+查看pv和pvc的状况
+# kubectl get pv,pvc
+
+
